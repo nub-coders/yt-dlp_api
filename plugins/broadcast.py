@@ -1,7 +1,7 @@
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-from tools import redis_client, is_admin
+from tools import redis_client, scan_keys, is_admin
 
 @Client.on_message(filters.command("broadcast") & filters.private)
 async def broadcast_command(client: Client, message: Message):
@@ -31,7 +31,7 @@ async def broadcast_command(client: Client, message: Message):
         drop_author = "-f" in command_parts
         
         # Get all user IDs from Redis
-        user_keys = redis_client.keys("user_token:*")
+        user_keys = scan_keys("user_token:*")
         stored_user_ids = [int(key.split(":")[1]) for key in user_keys]
         total_users = len(stored_user_ids)
         

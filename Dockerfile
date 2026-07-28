@@ -31,5 +31,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 
-# Default command
-CMD ["python3", "main.py"]
+# Workers default to 1; set WEB_CONCURRENCY env var to scale (e.g. 4).
+# Note: with multiple workers the Telegram bot must run separately via bot.py
+# (Phase 4.4). Single-worker deployments can keep using python3 main.py.
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${WEB_CONCURRENCY:-1}"]

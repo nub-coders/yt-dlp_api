@@ -31,7 +31,7 @@ GROUP = os.environ.get("TG_GROUP", "nub_coder_s")
 CHANNEL = os.environ.get("TG_CHANNEL", "nub_coders")
 
 # ── API Base URL ───────────────────────────────────────────────
-BASE_URL = os.environ.get("BASE_URL", "http://api.nubcoders.com").rstrip("/")
+BASE_URL = os.environ.get("BASE_URL", "https://api.nubcoders.com").rstrip("/")
 
 admin_ids_str = os.environ.get("ADMIN_IDS", "")
 ADMIN_IDS = [int(x) for x in admin_ids_str.split() if x.isdigit()]

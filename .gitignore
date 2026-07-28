@@ -61,3 +61,7 @@ Thumbs.db
 
 # Bootstrapped yt-dlp cookies
 cookies.txt
+
+# Runtime stream cache
+utils/.cache/
+.pytest_cache/

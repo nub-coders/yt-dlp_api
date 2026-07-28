@@ -7,6 +7,7 @@ import logging
 from urllib.parse import urlparse, parse_qs
 
 from utils.cookies import cookie_args
+from utils.subprocess_limit import subprocess_slot
 
 __all__ = ["get_stream", "get_video_stream"]
 
@@ -116,15 +117,16 @@ async def _run_yt_dlp(url: str, format_selector: str, cookies: str | None):
 
     logger.info(f"[YT-DLP] Running: {' '.join(cmd)}")
     try:
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(),
-            timeout=40,
-        )
+        async with subprocess_slot:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=40,
+            )
         if process.returncode == 0 and stdout:
             return stdout.decode().strip().split("\n")[0]
         else:

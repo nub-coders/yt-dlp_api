@@ -4,6 +4,7 @@ import re
 import orjson
 import asyncio
 import os
+from utils.bounded_cache import BoundedCache
 
 UPSTASH_REDIS_REST_URL   = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
@@ -19,8 +20,9 @@ YT_REGEX           = re.compile(r"ytInitialData\s*=\s*(\{.+?\});", re.DOTALL)
 # One shared client for the lifetime of the process.
 _client = httpx.AsyncClient(http2=True, timeout=15, headers=HEADERS)
 
-MEMORY_CACHE: dict = {}
-LOCKS:        dict = {}
+# ponytail: stdlib OrderedDict LRU+TTL — avoids cachetools dep; single event loop, no locking needed
+MEMORY_CACHE: BoundedCache = BoundedCache(maxsize=5000, ttl=300)
+LOCKS:        BoundedCache = BoundedCache(maxsize=5000)
 
 _NORMALIZE_RE = re.compile(r"\s+")
 
@@ -201,4 +203,4 @@ async def fetch_suggestions(query: str, limit: int = 10):
     return data.get("suggested", [])
 
 
-__all__ = ["Search", "Trending", "Suggest", "close_client"]
+__all__ = ["fetch_results", "fetch_trending", "fetch_suggestions", "close_client"]

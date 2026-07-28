@@ -1,10 +1,16 @@
-aiohttp
-beautifulsoup4
-httpx[http2]>=0.25.0
-orjson>=3.9.0
-fastapi
-uvicorn[standard]
-kurigram
-redis[asyncio]>=4.2
-tgcrypto
+# Direct dependencies pinned for reproducible builds.
+# yt-dlp is intentionally NOT pinned: YouTube breaks extractors every 1-2 weeks,
+# so we always build against the latest. Trade-off: a bad yt-dlp release can
+# regress extraction with no lockfile to roll back to — rebuild to recover.
+# ponytail: pin yt-dlp too (==<version>) if you need rollback-safe deploys more
+# than same-day YouTube fixes.
+aiohttp==3.13.3
+beautifulsoup4==4.14.3
+httpx[http2]==0.28.1
+orjson==3.11.7
+fastapi==0.129.2
+uvicorn[standard]==0.41.0
+kurigram==2.2.23
+redis[asyncio]==7.2.0
+tgcrypto==1.2.5
 yt-dlp[default]

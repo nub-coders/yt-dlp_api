@@ -8,7 +8,6 @@ import datetime
 import hashlib
 import base64
 from typing import Optional
-from collections import defaultdict
 import uvicorn
 import threading
 from pyrogram import Client, idle
@@ -22,7 +21,9 @@ from starlette.routing import Match
 from starlette.responses import Response
 
 # Telegram Bot Configuration
-from config import API_ID, API_HASH, BOT_TOKEN, GROUP, CHANNEL
+from config import API_ID, API_HASH, BOT_TOKEN, GROUP, CHANNEL, DAILY_LIMIT, ADMIN_LIMIT
+from bot_commands import setup_bot_commands
+from utils.url_validation import validate_youtube_target
 
 # Import shared tools
 from tools import (
@@ -46,49 +47,43 @@ telegram_app = Client(
     lang_pack="tdesktop"
 )
 
-def setup_bot_commands():
-    """Set up bot commands menu"""
-    from pyrogram.types import BotCommand
-
-    commands = [
-        BotCommand("start", "🚀 Get your API token and welcome message"),
-        BotCommand("menu", "📋 Show main menu with options"),
-        BotCommand("ping", "🏓 Check bot latency"),
-        BotCommand("status", "📊 Check your usage statistics"),
-        BotCommand("token", "🔑 View your current API token"),
-        BotCommand("revoke", "🔄 Revoke your current token"),
-        BotCommand("help", "❓ Get help and API documentation"),
-    ]
-
-    try:
-        telegram_app.set_bot_commands(commands)
-        print("✅ Bot commands set successfully")
-    except Exception as e:
-        print(f"⚠️ Failed to set bot commands: {e}")
-
-try:
-    telegram_app.start()
-    setup_bot_commands()
-    telegram_app.stop()
-except Exception as e:
-    print(f"Bot setup skipped (will retry at runtime): {e}")
+import os as _os
 
 
 # ─────────────────────────── FastAPI ───────────────────────────
 
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Bootstrap yt-dlp cookies on API startup so it works under `uvicorn main:app`
+    # (any worker/replica), not just `python3 main.py`.
+    # ponytail: with --workers>1 in ONE container the workers race on cookies.txt;
+    # recommended scaling is WEB_CONCURRENCY=1 + multiple replicas (each writes its
+    # own container-local file). Bump to a file lock only if you must run N>1 in one box.
+    if not _os.getenv("TESTING"):
+        try:
+            from utils.logging_config import setup_json_logging
+            setup_json_logging()
+            from utils.cookies import bootstrap as bootstrap_cookies, start_refresh
+            bootstrap_cookies()
+            start_refresh()
+        except Exception as e:
+            logging.error(f"[STARTUP] Cookie bootstrap failed: {e}")
+    yield
+
+
 app = FastAPI(
     title="yt-dlp_api API",
-    description="API for yt-dlp-based search, streaming, and playlist extraction with Telegram bot integration"
+    description="API for yt-dlp-based search, streaming, and playlist extraction with Telegram bot integration",
+    lifespan=lifespan,
 )
 
 # Rate limiting
-daily_request_counts = defaultdict(lambda: {"count": 0, "date": datetime.date.today()})
-DAILY_LIMIT = 1000
-ADMIN_LIMIT = 10000
-
 FREE_PATHS = frozenset([
     "/", "/search", "/trending", "/suggest", "/health",
-    "/rate-limit-status", "/docs", "/openapi.json",
+    "/rate-limit-status", "/docs", "/openapi.json", "/metrics",
 ])
 
 _FREE_PREFIXES = (
@@ -97,8 +92,20 @@ _FREE_PREFIXES = (
 )
 
 # ─────────────────────────── Redirect Stream Storage ───────────────────────────
-# Maps stream_id -> {url, mode, extracted_url, extracted_time}
-_STREAM_CACHE = {}  # In-memory cache for redirect stream URLs
+# Job state lives in Redis (key stream_job:{id} -> JSON {url, mode, extracted_url,
+# extracted_time}) so /stream/redirect and /stream/resolver can land on different
+# replicas behind a non-sticky load balancer. TTL covers the 45s resolver wait + buffer.
+import json as _json
+from tools import get_async_redis
+
+_STREAM_TTL = 120
+
+
+async def _job_get(stream_id: str) -> Optional[dict]:
+    redis = await get_async_redis()
+    raw = await redis.get(f"stream_job:{stream_id}")
+    return _json.loads(raw) if raw else None
+
 
 def _encode_stream_id(url: str, mode: str) -> str:
     """Generate a stable stream ID from URL + mode"""
@@ -115,14 +122,18 @@ def _start_background_extraction(stream_id: str, url: str, mode: str):
             else:
                 from utils.cache_manager import get_stream
                 stream_url = await get_stream(url)
-            
+
             if stream_url:
-                _STREAM_CACHE[stream_id]["extracted_url"] = stream_url
-                _STREAM_CACHE[stream_id]["extracted_time"] = time.time()
-                logging.info(f"[STREAM_RESOLVER] Extracted {mode} URL for {stream_id}")
+                redis = await get_async_redis()
+                job = await _job_get(stream_id)
+                if job is not None:  # tolerate TTL expiry under load
+                    job["extracted_url"] = stream_url
+                    job["extracted_time"] = time.time()
+                    await redis.set(f"stream_job:{stream_id}", _json.dumps(job), ex=_STREAM_TTL)
+                    logging.info(f"[STREAM_RESOLVER] Extracted {mode} URL for {stream_id}")
         except Exception as e:
             logging.error(f"[STREAM_RESOLVER] Failed to extract {mode}: {e}")
-    
+
     asyncio.create_task(extract())
 
 
@@ -130,28 +141,39 @@ def _resolve_mode(mode: str) -> str:
     return "video" if mode == "video" else "audio"
 
 
-def _ensure_stream_job(url: str, mode: str) -> str:
+async def _ensure_stream_job(url: str, mode: str) -> str:
+    validate_youtube_target(url)  # SSRF guard: only YouTube targets reach yt-dlp
     resolved_mode = _resolve_mode(mode)
     stream_id = _encode_stream_id(url, resolved_mode)
 
-    if stream_id not in _STREAM_CACHE:
-        _STREAM_CACHE[stream_id] = {
-            "url": url,
-            "mode": resolved_mode,
-            "extracted_url": None,
-            "extracted_time": None,
-        }
+    redis = await get_async_redis()
+    # SET NX: only the first replica to claim this id starts extraction; others reuse it.
+    created = await redis.set(
+        f"stream_job:{stream_id}",
+        _json.dumps({"url": url, "mode": resolved_mode, "extracted_url": None, "extracted_time": None}),
+        ex=_STREAM_TTL,
+        nx=True,
+    )
+    if created:
         _start_background_extraction(stream_id, url, resolved_mode)
 
     return stream_id
 
 
-def _make_temp_redirect(request: Request, url: str, mode: str) -> str:
-    stream_id = _ensure_stream_job(url, mode)
+async def _make_temp_redirect(request: Request, url: str, mode: str) -> str:
+    stream_id = await _ensure_stream_job(url, mode)
     return str(
         request.url_for("stream_resolver", stream_id=stream_id)
         .replace(scheme="https")
     )
+
+
+def _token_from_request(request: Request) -> Optional[str]:
+    """Prefer `Authorization: Bearer <token>`; fall back to the deprecated ?token= query param."""
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip() or None
+    return request.query_params.get("token")
 
 
 async def get_current_user(token: Optional[str] = Query(None)):
@@ -159,21 +181,21 @@ async def get_current_user(token: Optional[str] = Query(None)):
     if not token:
         return None
     try:
-        user_id = get_user_by_token(token)
+        user_id = await get_user_by_token(token)
         return user_id
     except:
         return None
 
 
-async def require_token(token: Optional[str] = Query(None, description="Your API token")):
-    """Require valid token for protected endpoints"""
-    user_id = await get_current_user(token)
+async def require_token(request: Request):
+    """Require valid token (header or ?token=) for protected endpoints"""
+    user_id = await get_current_user(_token_from_request(request))
     if not user_id:
         raise HTTPException(
             status_code=401,
             detail={
                 "error": "Token required",
-                "message": "Please get your token from the Telegram bot using /start command and add it as ?token=YOUR_TOKEN"
+                "message": "Get your token from the Telegram bot via /start and send it as 'Authorization: Bearer <token>' (or the deprecated ?token= query param)"
             }
         )
     return user_id
@@ -187,7 +209,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         ):
             return await call_next(request)
 
-        token   = request.query_params.get("token")
+        token   = _token_from_request(request)
         user_id = await get_current_user(token)
 
         if not user_id:
@@ -399,6 +421,24 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 app.add_middleware(RateLimitMiddleware)
 
 
+@app.middleware("http")
+async def _metrics_middleware(request: Request, call_next):
+    from utils import metrics
+    start = time.time()
+    response = await call_next(request)
+    # Use the route template (not the raw path) so per-id URLs don't explode cardinality
+    route = request.scope.get("route")
+    path = getattr(route, "path", request.url.path)
+    metrics.record(request.method, path, response.status_code, time.time() - start)
+    return response
+
+
+@app.get("/metrics")
+async def metrics_endpoint():
+    from utils import metrics
+    return Response(content=metrics.render(), media_type="text/plain; version=0.0.4")
+
+
 # ─────────────────────────── Endpoints ───────────────────────────
 
 @app.get("/")
@@ -477,7 +517,7 @@ async def video_stream_redirect(
     user_id: int = Depends(require_token)
 ):
     """Get instant redirect URL for video or audio stream (pytgcall friendly!)."""
-    stream_id = _ensure_stream_job(q, "video" if type == "video" else "audio")
+    stream_id = await _ensure_stream_job(q, "video" if type == "video" else "audio")
 
     # Return 307 Temporary Redirect to resolver
     return RedirectResponse(
@@ -493,31 +533,31 @@ async def video_stream_redirect(
 @app.get("/video-stream/resolver/{stream_id}")
 async def video_stream_resolver(stream_id: str):
     """Resolver endpoint for video stream redirect."""
-    if stream_id not in _STREAM_CACHE:
+    job = await _job_get(stream_id)
+    if job is None:
         return JSONResponse(
             content={"error": "Stream not found", "hint": "Use /video-stream/redirect to get a valid URL"},
             status_code=404
         )
-    
-    cache_entry = _STREAM_CACHE[stream_id]
-    
-    # If not extracted yet, wait up to 45s for extraction
-    if cache_entry["extracted_url"] is None:
+
+    # If not extracted yet, poll Redis up to 45s for the background job to finish
+    if job["extracted_url"] is None:
         logging.info(f"[VIDEO_STREAM_RESOLVER] Waiting for extraction... {stream_id}")
         for i in range(45):  # 45 second timeout
-            if cache_entry["extracted_url"] is not None:
-                break
             await asyncio.sleep(1)
-    
-    if cache_entry["extracted_url"]:
+            job = await _job_get(stream_id)
+            if job is None or job["extracted_url"] is not None:
+                break
+
+    if job and job["extracted_url"]:
         logging.info(f"[VIDEO_STREAM_RESOLVER] Redirecting to stream URL {stream_id}")
         return RedirectResponse(
-            url=cache_entry["extracted_url"],
+            url=job["extracted_url"],
             status_code=307
         )
     else:
         return JSONResponse(
-            content={"error": "Failed to extract stream URL", "url": cache_entry["url"]},
+            content={"error": "Failed to extract stream URL", "url": job["url"] if job else None},
             status_code=500
         )
 
@@ -531,7 +571,7 @@ async def stream_redirect(
     user_id: int = Depends(require_token)
 ):
     """Get instant redirect URL for streaming (pytgcall friendly!)."""
-    stream_id = _ensure_stream_job(q, mode)
+    stream_id = await _ensure_stream_job(q, mode)
 
     # Return 307 Temporary Redirect to resolver
     return RedirectResponse(
@@ -547,31 +587,31 @@ async def stream_redirect(
 @app.get("/stream/resolver/{stream_id}")
 async def stream_resolver(stream_id: str):
     """Resolver endpoint for redirect streaming."""
-    if stream_id not in _STREAM_CACHE:
+    job = await _job_get(stream_id)
+    if job is None:
         return JSONResponse(
             content={"error": "Stream not found", "hint": "Use /stream/redirect to get a valid URL"},
             status_code=404
         )
-    
-    cache_entry = _STREAM_CACHE[stream_id]
-    
-    # If not extracted yet, wait up to 45s for extraction
-    if cache_entry["extracted_url"] is None:
+
+    # If not extracted yet, poll Redis up to 45s for the background job to finish
+    if job["extracted_url"] is None:
         logging.info(f"[STREAM_RESOLVER] Waiting for extraction... {stream_id}")
         for i in range(45):  # 45 second timeout
-            if cache_entry["extracted_url"] is not None:
-                break
             await asyncio.sleep(1)
-    
-    if cache_entry["extracted_url"]:
+            job = await _job_get(stream_id)
+            if job is None or job["extracted_url"] is not None:
+                break
+
+    if job and job["extracted_url"]:
         logging.info(f"[STREAM_RESOLVER] Redirecting to stream URL {stream_id}")
         return RedirectResponse(
-            url=cache_entry["extracted_url"],
+            url=job["extracted_url"],
             status_code=307
         )
     else:
         return JSONResponse(
-            content={"error": "Failed to extract stream URL", "url": cache_entry["url"]},
+            content={"error": "Failed to extract stream URL", "url": job["url"] if job else None},
             status_code=500
         )
 
@@ -582,7 +622,7 @@ async def get_stream_url(
     q: str = Query(..., description="YouTube video URL"),
     mode: str = Query("audio", description="Mode: 'audio' or 'video'"),
     redirect: bool = Query(False, description="Return a temporary redirect URL instead of the final stream URL"),
-    token: str = Query(..., description="Your API token"),
+    token: Optional[str] = Query(None, description="API token (deprecated — prefer 'Authorization: Bearer <token>')"),
     user_id: int = Depends(require_token)
 ):
     """Get stream URL for a YouTube video.
@@ -591,6 +631,7 @@ async def get_stream_url(
     - `audio`: Best audio stream (m4a)
     - `video`: Best combined video+audio (mp4, 360p)
     """
+    validate_youtube_target(q)  # SSRF guard
     start_time = time.time()
 
     try:
@@ -599,7 +640,7 @@ async def get_stream_url(
             return JSONResponse(content={
                 "url": q,
                 "mode": mode,
-                "redirect_url": _make_temp_redirect(request, q, mode),
+                "redirect_url": await _make_temp_redirect(request, q, mode),
                 "stream_url": None,
                 "time_taken": f"{elapsed} sec"
             })
@@ -639,7 +680,7 @@ async def video_stream_urls(
     request: Request,
     q: str = Query(..., description="YouTube video URL"),
     redirect: bool = Query(False, description="Return a temporary redirect URL instead of separate stream URLs"),
-    token: str = Query(..., description="Your API token"),
+    token: Optional[str] = Query(None, description="API token (deprecated — prefer 'Authorization: Bearer <token>')"),
     user_id: int = Depends(require_token)
 ):
     """Get separate best-quality video and audio URLs.
@@ -647,6 +688,7 @@ async def video_stream_urls(
     Returns two URLs: bestvideo (mp4) + bestaudio (m4a).
     Use these with ffmpeg or a player that supports dual-source playback.
     """
+    validate_youtube_target(q)  # SSRF guard
     start_time = time.time()
 
     try:
@@ -654,7 +696,7 @@ async def video_stream_urls(
             elapsed = round(time.time() - start_time, 2)
             return JSONResponse(content={
                 "url": q,
-                "redirect_url": _make_temp_redirect(request, q, "video"),
+                "redirect_url": await _make_temp_redirect(request, q, "video"),
                 "stream_url": None,
                 "time_taken": f"{elapsed} sec"
             })
@@ -691,10 +733,11 @@ async def video_info(
     max_results: int = Query(1, description="Max results for search queries", ge=1, le=10),
     mode: str = Query("audio", description="Mode: 'audio' for audio-only, 'video' for video stream"),
     redirect: bool = Query(True, description="Return a temporary redirect URL instead of waiting for the final stream"),
-    token: str = Query(..., description="Your API token"),
+    token: Optional[str] = Query(None, description="API token (deprecated — prefer 'Authorization: Bearer <token>')"),
     user_id: int = Depends(require_token)
 ):
     """Get video info + stream URL (token required)"""
+    validate_youtube_target(q)  # SSRF guard (bare search phrases pass — no host to SSRF)
     start_time = time.time()
 
     def extract_video_id_from_url(value: str) -> str | None:
@@ -726,7 +769,7 @@ async def video_info(
             metadata_task = asyncio.create_task(GetVideoById(video_id)) if video_id else None
 
             if redirect:
-                temp_redirect_url = _make_temp_redirect(request, q, mode)
+                temp_redirect_url = await _make_temp_redirect(request, q, mode)
                 metadata_result = await metadata_task if metadata_task else None
                 info = metadata_result if isinstance(metadata_result, dict) else {}
 
@@ -756,7 +799,7 @@ async def video_info(
                 "channel_name": info.get("channel_name") or info.get("channel") or info.get("artist_name"),
                 "views": info.get("views"),
                 "video_id": info.get("video_id"),
-                "stream_url": _make_temp_redirect(request, q, mode),
+                "stream_url": await _make_temp_redirect(request, q, mode),
                 "thumbnail": info.get("thumbnail"),
                 "time_taken": f"{elapsed} sec"
             })
@@ -780,7 +823,7 @@ async def video_info(
                     "channel_name": result.get("channel"),
                     "views": result.get("views"),
                     "video_id": result.get("video_id"),
-                    "stream_url": _make_temp_redirect(request, video_url, mode),
+                    "stream_url": await _make_temp_redirect(request, video_url, mode),
                     "thumbnail": result.get("thumbnail"),
                     "time_taken": f"{elapsed} sec"
                 })
@@ -861,7 +904,7 @@ async def suggest_songs(
 @app.get("/playlist")
 async def playlist_songs(
     url: str = Query(..., description="YouTube playlist URL or playlist ID (e.g. PLxxxxxxx, RDxxxxxx)"),
-    token: str = Query(..., description="Your API token"),
+    token: Optional[str] = Query(None, description="API token (deprecated — prefer 'Authorization: Bearer <token>')"),
     user_id: int = Depends(require_token)
 ):
     """Get all songs from a YouTube playlist.
@@ -939,14 +982,14 @@ def start_services():
 
 
 if __name__ == "__main__":
+    # All-in-one: FastAPI (with cookie bootstrap via lifespan) + Telegram bot in one
+    # process. For horizontal scaling run the API and bot separately instead —
+    # `uvicorn main:app --workers N` (or N replicas) + `python3 bot.py`.
     try:
-        import asyncio
-        from utils.cookies import bootstrap as bootstrap_cookies, start_refresh
-        bootstrap_cookies()
-        start_refresh()
         threading.Thread(target=start_services, daemon=True).start()
         try:
             telegram_app.start()
+            setup_bot_commands(telegram_app)
             me = telegram_app.me
             print(f"🤖 Bot Started: @{me.username} ({me.first_name}) [ID: {me.id}]")
             idle()

@@ -1,7 +1,7 @@
 import redis.asyncio as aioredis
 import redis as sync_redis
 import string
-import random
+import secrets
 import time
 
 from config import REDIS_HOST, REDIS_PORT, REDIS_USERNAME, REDIS_PASSWORD, ADMIN_IDS
@@ -37,8 +37,15 @@ async def get_async_redis():
         )
     return _async_redis
 
+
+def scan_keys(pattern: str = "*", count: int = 500) -> list[str]:
+    """Non-blocking replacement for redis_client.keys() — iterates via SCAN so it
+    doesn't stall Redis's single thread on a large keyspace."""
+    return list(redis_client.scan_iter(match=pattern, count=count))
+
 def generate_token() -> str:
-    return ''.join(random.choices(string.ascii_letters + string.digits, k=10))
+    # secrets, not random — token is a bearer credential
+    return ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(10))
 
 
 def mask_token(token: str | None) -> str:
@@ -101,9 +108,9 @@ async def revoke_user_token(user_id) -> None:
         await pipe.execute()
 
 
-def get_user_by_token(token) -> int | None:
-    # Called from sync FastAPI Depends — use sync client here only.
-    user_id = redis_client.get(f"token_user:{token}")
+async def get_user_by_token(token) -> int | None:
+    redis = await get_async_redis()
+    user_id = await redis.get(f"token_user:{token}")
     return int(user_id) if user_id else None
 
 
