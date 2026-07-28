@@ -3,6 +3,7 @@ import logging
 import time
 
 from utils.cookies import cookie_args
+from utils.subprocess_limit import subprocess_slot
 
 logger = logging.getLogger("yt_dlp_api.Video_Stream")
 
@@ -25,16 +26,17 @@ async def _extract_video(url: str, cookies: str | None = None):
     start = time.time()
 
     try:
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        async with subprocess_slot:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
 
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(),
-            timeout=40,
-        )
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=40,
+            )
 
     except asyncio.TimeoutError:
         logger.error(f"[VIDEO_EXTRACT] TIMEOUT after 40s")
@@ -74,16 +76,17 @@ async def _extract_audio(url: str, cookies: str | None = None):
     start = time.time()
 
     try:
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        async with subprocess_slot:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
 
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(),
-            timeout=40,
-        )
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=40,
+            )
 
     except asyncio.TimeoutError:
         logger.error(f"[AUDIO_EXTRACT] TIMEOUT after 40s")
@@ -125,30 +128,3 @@ async def resolve_stream_urls(url: str, cookies: str | None = None):
     
     logger.error(f"[VIDEO_AUDIO] ❌ Failed - video: {video_url is not None}, audio: {audio_url is not None}")
     return None, None
-
-
-async def mux_streams(video_url: str, audio_url: str):
-    ffmpeg_cmd = [
-        "ffmpeg",
-        "-loglevel", "error",
-        "-i", video_url,
-        "-i", audio_url,
-        "-c:v", "copy",
-        "-c:a", "copy",
-        "-f", "mp4",
-        "-movflags", "frag_keyframe+empty_moov+faststart",
-        "pipe:1",
-    ]
-
-    logger.info(f"[MERGE] Starting ffmpeg merge")
-
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *ffmpeg_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        return process
-    except Exception as e:
-        logger.error(f"[MERGE] ffmpeg failed: {e}")
-        return None

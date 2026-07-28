@@ -176,4 +176,4 @@ async def extract_playlist(input_value: str) -> List[Dict]:
     return parse_normal_playlist(data)
 
 
-__all__ = ["get_playlist_songs"]
+__all__ = ["extract_playlist"]

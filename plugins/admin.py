@@ -5,7 +5,7 @@ import datetime
 import statistics
 
 from tools import (
-    redis_client, is_admin, get_user_token, revoke_user_token,
+    redis_client, scan_keys, is_admin, get_user_token, revoke_user_token,
     get_user_request_count, set_user_request_count,
     get_failed_request_count, get_recent_errors
 )
@@ -48,13 +48,13 @@ async def _build_stats(client: Client, progress_callback=None):
         await progress_callback("🔌 Connecting to Redis cache database...")
 
     # ── User data ──────────────────────────────────────────
-    user_keys = redis_client.keys("user_token:*")
+    user_keys = scan_keys("user_token:*")
     total_users = len(user_keys)
 
     if progress_callback:
         await progress_callback(f"📊 Registered users loaded ({total_users:,} found). Scanning active sessions...")
 
-    request_keys = redis_client.keys("user_requests:*")
+    request_keys = scan_keys("user_requests:*")
     active_users = len(request_keys)
 
     total_requests_today = 0
@@ -132,7 +132,7 @@ async def _build_stats(client: Client, progress_callback=None):
     total_lookups = hits + misses
     hit_rate = round((hits / max(total_lookups, 1)) * 100, 1)
 
-    total_keys = len(redis_client.keys('*'))
+    total_keys = len(scan_keys('*'))
 
     # ── Usage percentages ──────────────────────────────────
     user_utilization = round((active_users / max(total_users, 1)) * 100, 1)
@@ -155,7 +155,7 @@ async def _build_stats(client: Client, progress_callback=None):
     global_failed = int(redis_client.get("global_failed_total") or 0)
 
     # Per-status breakdown
-    status_keys = redis_client.keys("failed_by_status:*")
+    status_keys = scan_keys("failed_by_status:*")
     status_breakdown = []
     for sk in status_keys:
         code = sk.split(":")[1]
@@ -164,7 +164,7 @@ async def _build_stats(client: Client, progress_callback=None):
     status_breakdown.sort(key=lambda x: x[1], reverse=True)
 
     # Per-path breakdown (top 5 failing endpoints)
-    path_keys = redis_client.keys("failed_by_path:*")
+    path_keys = scan_keys("failed_by_path:*")
     path_breakdown = []
     for pk in path_keys:
         path = pk.split(":", 1)[1]
@@ -174,7 +174,7 @@ async def _build_stats(client: Client, progress_callback=None):
     top_fail_paths = path_breakdown[:5]
 
     # Per-user failure leaderboard (top 5)
-    fail_user_keys = redis_client.keys("user_failed:*")
+    fail_user_keys = scan_keys("user_failed:*")
     user_fail_data = []
     for fk in fail_user_keys:
         uid = fk.split(":")[1]
@@ -421,7 +421,7 @@ async def list_users(client: Client, message: Message):
         await message.reply_text("❌ You don't have admin privileges.")
         return
     
-    user_keys = redis_client.keys("user_token:*")
+    user_keys = scan_keys("user_token:*")
     recent_users = []
     
     for key in user_keys[:20]:  # Show last 20 users

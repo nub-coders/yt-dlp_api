@@ -1,5 +1,9 @@
 # yt-dlp_api
 
+![CI](https://github.com/nub-coders/yt-dlp_api/actions/workflows/ci.yml/badge.svg)
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+![Python](https://img.shields.io/badge/python-3.13-blue.svg)
+
 A high-performance, asynchronous web API and Telegram bot ecosystem for YouTube search, metadata extraction, playlist parsing, and audio/video stream URL resolution. 
 
 This repository provides a unified FastAPI backend and a Pyrogram-based Telegram bot. It features native integration with Redis for caching and rate limiting, and uses Deno for solving YouTube EJS signature challenges.
@@ -14,7 +18,7 @@ This repository provides a unified FastAPI backend and a Pyrogram-based Telegram
 - 🗄️ **Redis Caching**: Caches stream metadata, resolving configurations, and rates to minimize latency and avoid YouTube rate limits.
 - 🔒 **Token-Based Rate Limiting**: Automatic user rate limiting managed via a Redis-backed token system.
 - 🤖 **Telegram Bot Management**: Simple Telegram bot for users to generate tokens, check limits, and for admins to manage users, customize rate limits, broadcast announcements, and view real-time API logs.
-- 🐳 **Docker-Compose Ready**: Easy, zero-config deployment using Docker Compose.
+- 🐳 **Docker-Compose Ready**: Container-based deployment via Docker Compose (behind Traefik, with an external Redis).
 
 ---
 
@@ -42,10 +46,12 @@ This repository provides a unified FastAPI backend and a Pyrogram-based Telegram
 
 ## Quick Start (Docker Deployment)
 
-The easiest way to run the entire stack (FastAPI, Telegram Bot, Redis) is using Docker Compose.
+The Docker Compose stack runs the FastAPI backend and Telegram bot as **two separate services** sharing Redis. **Redis and a Traefik reverse proxy are external dependencies you must provide** — the compose file does not start them (see Prerequisites).
 
 ### 1. Prerequisites
-Ensure you have [Docker](https://docs.docker.com/get-docker/) and [Docker Compose](https://docs.docker.com/compose/install/) installed.
+Ensure you have [Docker](https://docs.docker.com/get-docker/) and [Docker Compose](https://docs.docker.com/compose/install/) installed, plus:
+- A reachable **Redis** instance (self-hosted or managed, e.g. Upstash) — set its host/credentials in `.env`.
+- An external Docker network named `web` attached to a Traefik reverse proxy (`docker network create web`). The compose file publishes the API through Traefik labels, not a raw port mapping.
 
 ### 2. Configure Environment Variables
 Create a `.env` file in the root directory and configure your credentials:
@@ -59,8 +65,8 @@ BOT_TOKEN=your_bot_token
 # Space-separated list of Telegram user IDs with administrative rights
 ADMIN_IDS="6076474757 2128132096"
 
-# Redis Configuration (Optional: default uses redis service container)
-REDIS_HOST=redis
+# Redis Configuration (external instance — host, port and credentials)
+REDIS_HOST=your-redis-host
 REDIS_PORT=6379
 
 # API Rate Limits
@@ -71,7 +77,7 @@ ADMIN_LIMIT=10000
 API_HOST=api.nubcoders.com
 
 # Public API Base URL
-BASE_URL=http://api.nubcoders.com
+BASE_URL=https://api.nubcoders.com
 ```
 
 ### 3. Run the Services
@@ -81,10 +87,11 @@ Start the application stack:
 docker-compose up --build -d
 ```
 
-This will spin up:
-- **FastAPI Web API** on port `8000`
-- **Telegram Bot** runner
-- **Redis Cache Database**
+This will spin up two containers:
+- **`ytmusic-api`** — FastAPI Web API on port `8000` (routed via Traefik). Stateless: job state lives in Redis, so you can scale it with `docker compose up -d --scale ytmusic-api=4`.
+- **`ytmusic-bot`** — Telegram bot runner. Single long-poll consumer — never scale past 1.
+
+Redis is connected to as an external service using the credentials in `.env`.
 
 ---
 
@@ -136,9 +143,27 @@ All secrets and configurations can be customized via environment variables:
 | `REDIS_USERNAME`| Username for Redis authentication | `default` |
 | `REDIS_PASSWORD`| Password for Redis authentication | `None` |
 | `API_HOST` | Traefik host used by Docker Compose | `api.nubcoders.com` |
-| `BASE_URL` | Public base URL used in bot/docs | `http://api.nubcoders.com` |
+| `BASE_URL` | Public base URL used in bot/docs | `https://api.nubcoders.com` |
 | `DAILY_LIMIT` | Default daily requests limit for free tier users | `1000` |
 | `ADMIN_LIMIT` | Default daily requests limit for administrators | `10000` |
+| `COOKIES_FILE` | Path to a Netscape-format YouTube cookies file | `cookies.txt` |
+| `COOKIES_BROWSER` | Browser profile to export cookies from (local dev only) | `firefox` |
+| `COOKIES_REFRESH_HOURS` | Re-export cookies from the browser every N hours (`0` disables) | `6` |
+| `YTDLP_MAX_PROCS` | Max concurrent yt-dlp/ffmpeg subprocesses (backpressure cap) | `2 × CPU count` |
+| `WEB_CONCURRENCY` | Uvicorn worker processes per API container | `1` |
+
+### Cookies & Security
+
+yt-dlp uses a YouTube cookie jar to avoid bot-detection on some videos. In the Docker setup, cookies are exported automatically at startup from a **Firefox profile mounted into the container** (`${HOME}/.mozilla/firefox` → `/root/.mozilla/firefox`, see `docker-compose.yml`) and re-exported every `COOKIES_REFRESH_HOURS`.
+
+**A logged-in browser profile is a bearer credential for that Google/YouTube account** — anyone who can read the profile or the exported `cookies.txt` can act as that account. Treat it accordingly:
+
+- **Use a throwaway YouTube account, never a personal/primary one.** If the container or host is compromised, the session is fully exposed.
+- The container runs as root specifically so it can read the mounted profile at `/root/.mozilla`. If you don't need browser auto-export, mount a pre-exported `cookies.txt` at `/app/cookies.txt` and set `COOKIES_REFRESH_HOURS=0` instead.
+- To export a cookies file by hand on a trusted machine:
+  ```bash
+  yt-dlp --cookies-from-browser firefox --cookies cookies.txt --skip-download "https://www.youtube.com/watch?v=BaW_jenozKc"
+  ```
 
 ---
 
@@ -154,6 +179,9 @@ Returns service health status.
 
 #### `GET /`
 Returns service metadata and an endpoint directory.
+
+#### `GET /metrics`
+Prometheus metrics (request counts + latency summary) in text exposition format. Per-process — scrape each API replica as its own target.
 
 #### `GET /search`
 Perform queries on YouTube or YouTube Music.
@@ -177,7 +205,8 @@ Get search completion suggestions for a partial query.
 ---
 
 ### Authenticated Endpoints
-*Must include query parameter: `token=YOUR_API_TOKEN`*
+*Authenticate with a header: `Authorization: Bearer YOUR_API_TOKEN`.*
+*The `?token=YOUR_API_TOKEN` query parameter is still accepted but **deprecated** — it leaks into proxy/access logs and browser history. Prefer the header. (The `/stream/redirect` and `/video-stream/redirect` endpoints still require `?token=` so it can be carried through the 307 redirect.)*
 
 #### `GET /rate-limit-status`
 Check your current token request usage and remaining quota.
